@@ -362,19 +362,124 @@ pub async fn run_tool(
 
 This tool returns complete diff information after editing, demonstrating how to provide detailed operation results in a single response.
 
+## SDK Version Upgrade Analysis
+
+### Current Version vs Latest Version
+
+**Current Version**: `rust-mcp-sdk v0.8.1`
+**Latest Available Version**: `rust-mcp-sdk v0.8.3` (Released February 2026)
+
+### New Features in Latest Version
+
+Based on investigation of rust-mcp-sdk v0.8.3, the SDK now supports:
+
+1. **Progress Notifications**
+   - MCP Protocol 2025-11-25 natively supports progress notifications
+   - SDK provides `notify_progress()` method
+   - Can send progress updates during tool execution
+
+2. **Progress Notification Structure**
+   ```rust
+   pub struct ProgressNotificationParams {
+       // Optional message describing current progress
+       pub message: Option<String>,
+       // Progress value (0.0 to 1.0 or other agreed range)
+       pub progress: f64,
+       // Metadata
+       pub meta: Option<Map<String, Value>>,
+   }
+   ```
+
+3. **McpServer Trait Method**
+   ```rust
+   async fn notify_progress(&self, params: ProgressNotificationParams) -> SdkResult<()>
+   ```
+
+### Implementation Approach: Using Progress Notifications
+
+After upgrading to v0.8.3, progress notifications can be sent during file writing:
+
+```rust
+use rust_mcp_sdk::schema::ProgressNotificationParams;
+
+impl WriteFile {
+    pub async fn run_tool(
+        params: Self,
+        context: &FileSystemService,
+        runtime: Arc<dyn McpServer>,  // New parameter
+    ) -> std::result::Result<CallToolResult, CallToolError> {
+        let content = &params.content;
+        let lines: Vec<&str> = content.lines().collect();
+        let total_lines = lines.len();
+        
+        // Send start notification
+        let _ = runtime.notify_progress(ProgressNotificationParams {
+            message: Some(format!("Starting to write {} lines to {}", total_lines, params.path)),
+            progress: 0.0,
+            meta: None,
+        }).await;
+        
+        // Perform write (can process in chunks)
+        let file_path = Path::new(&params.path);
+        
+        // For large files, write in chunks and report progress
+        if total_lines > 100 {
+            let mut file = tokio::fs::File::create(file_path).await?;
+            for (idx, line) in lines.iter().enumerate() {
+                file.write_all(line.as_bytes()).await?;
+                file.write_all(b"\n").await?;
+                
+                // Report progress every 10%
+                if (idx + 1) % (total_lines / 10).max(1) == 0 {
+                    let progress = (idx + 1) as f64 / total_lines as f64;
+                    let _ = runtime.notify_progress(ProgressNotificationParams {
+                        message: Some(format!("Written {}/{} lines", idx + 1, total_lines)),
+                        progress,
+                        meta: None,
+                    }).await;
+                }
+            }
+            file.flush().await?;
+        } else {
+            // Small files: direct write
+            context.write_file(file_path, content).await?;
+        }
+        
+        // Send completion notification
+        let _ = runtime.notify_progress(ProgressNotificationParams {
+            message: Some(format!("Completed writing {} lines", total_lines)),
+            progress: 1.0,
+            meta: None,
+        }).await;
+        
+        Ok(CallToolResult::text_content(vec![TextContent::from(
+            format!("Successfully wrote {} lines to {}", total_lines, params.path),
+        )]))
+    }
+}
+```
+
 ## Conclusion
 
 ### Streaming Output
 
-**Conclusion**: ❌ **Current MCP protocol and SDK do not support true streaming output**
+**Updated Conclusion**: ✅ **Progress notifications ARE possible after upgrading to rust-mcp-sdk v0.8.3**
 
-MCP protocol is based on JSON-RPC 2.0 request-response pattern and doesn't support returning multiple responses or streaming data in a single tool call. Implementing true streaming output would require:
+While tool calls still follow request-response pattern (ultimately returning single `CallToolResult`), MCP Protocol 2025-11-25 and rust-mcp-sdk v0.8.3+ now support:
 
-1. MCP protocol specification extension (support for server push or streaming responses)
-2. Major update to rust-mcp-sdk (support for streaming response types)
-3. Corresponding client support
+1. **Progress Notifications**: Can send multiple progress update notifications during tool execution
+2. **Non-blocking Notifications**: Progress notifications are one-way, don't need to wait for response
+3. **Standardized Interface**: Send via `notify_progress()` method, clients can handle standardly
 
-These changes exceed the scope of a single project and would need coordination at the MCP ecosystem level.
+**Key Changes**:
+- ❌ ~~"Does not support true streaming output"~~ 
+- ✅ **Supports progress notifications, can report progress in real-time during writes**
+- ✅ **Tools still return single final result, but process can have multiple progress updates**
+
+This means:
+- Can report progress when writing large files (written X/Y lines)
+- Clients can display progress bars or status updates
+- No need to modify MCP protocol itself
 
 ### Line-Level Output
 
@@ -393,13 +498,45 @@ This approach:
 - ✅ No protocol or SDK modifications needed
 - ✅ Provides valuable detailed information about write operations to users
 
-## Recommendations
+## Upgrade Recommendations
 
-1. **Short-term**: Implement "Enhanced Response Content" approach, adding detailed statistics and content preview to `write_file` tool
+### Immediately Actionable Approach (Recommended ⭐⭐⭐⭐⭐)
 
-2. **Medium-term**: Consider adding optional parameters (like `verbose` or `show_preview`), allowing users to choose simple or detailed response
+**Upgrade to rust-mcp-sdk v0.8.3 and implement progress notifications**
 
-3. **Long-term**: If MCP protocol supports streaming responses or progress reporting in the future, can consider reimplementation to leverage these new features
+**Implementation Steps**:
+
+1. **Update Cargo.toml**
+   ```toml
+   [dependencies]
+   rust-mcp-sdk = {version="0.8.3", default-features = false, features = [
+       "server",
+       "macros",
+       "stdio"
+   ] }
+   ```
+
+2. **Modify write_file tool signature**
+   - Add `runtime: Arc<dyn McpServer>` parameter to `run_tool` method
+   - Call `runtime.notify_progress()` during write process to send progress updates
+
+3. **Update tool invocation in handler.rs**
+   - Pass `runtime` parameter to tool's `run_tool` method
+
+**Advantages**:
+- ✅ Uses MCP protocol standard features, no hacks needed
+- ✅ Clients can display progress standardly (progress bars, percentages, etc.)
+- ✅ Works with all clients supporting MCP 2025-11-25 protocol
+- ✅ Minimal code changes, good backward compatibility
+- ✅ Low performance overhead (only sends notifications when needed)
+
+### Additional Recommendations
+
+1. **Short-term**: Also implement "Enhanced Response Content" approach, providing detailed statistics in final response
+
+2. **Medium-term**: Enable progress notifications for large files (e.g., > 1000 lines), keep simple responses for small files
+
+3. **Long-term**: Monitor MCP protocol evolution, adopt better streaming support features when available
 
 ## References
 
